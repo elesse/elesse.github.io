@@ -1,0 +1,209 @@
+---
+title: "Practical Machine Learning"
+author: "Elesse"
+date: "27 Mai 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+## Peer-graded Assignment: Prediction Assignment Writeup
+
+### Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). See the section on the Weight Lifting Exercise Dataset.
+
+
+### Data
+
+The training data for this project is available here: [pml-training.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+The test data is available here: [pml-testing.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+For reproducibility, the following libraries should be installed and loaded, in order to accomplish all processing steps included in this report:
+
+```{r echo = TRUE, message = FALSE}
+library(caret)
+library(parallel)
+library(doParallel)
+library(rattle)
+```
+
+#### Data Processing
+
+When it comes to machine learning, one should consider the quality of data as most crucial element.  Incomplete, irrelevant and inaccurate data sets are all sources of errors that will be inevitably incorporated in any machine learning analysis giving to the observation *"garbage in, garbage out"* all its sense. For such high-quality demanding analysis, we should thus spend enough time wrangling efficiently our data.  
+Fortunately, the tidying of the data was already done in this project ^[Velloso, E., Bulling, A., Gellersen, H., Ugulino, W., & Fuks, H. (2013, March). Qualitative activity recognition of weight lifting exercises. In Proceedings of the 4th Augmented Human International Conference (pp. 116-123). ACM.] (a data summary is given [here](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-predictionSummary.md)).  
+Nonetheless, a look at its content shows at first sight a substantive occurrence of various missing and/or irrelevant inputs ("NA", "", #Div/0!") which need to be normalized from the notational point of view.
+
+```{r dwnReadData}
+#download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml-training.csv")
+#download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "pml-testing.csv")
+preTest <- read.csv("pml-testing.csv", na.strings = c("NA", "", "#DIV/0!"))
+preTrain <- read.csv("pml-training.csv", na.strings = c("NA", "", "#DIV/0!")) 
+```
+
+The data is then processed as follows:  
+
+1. the 1st and 6th columns (resp. observation's number and "new_number") are irrelevant in this context and thus excluded,  
+
+2. the columns with down to 90% of "NA" values are also excluded,  
+
+3. In case, two predictors present high pairwise correlation (in term of the Pearson's correlation coefficient ^[Pearson, K. (1896). Mathematical contributions to the theory of evolution. III. Regression, heredity, and panmixia. Philosophical Transactions of the Royal Society of London. Series A, containing papers of a mathematical or physical character, 187, 253-318.]), only the best is kept (the one with the smallest mean absolute correlation). The cut off value of the Pearson's correlation coefficient is usually chosen to be higher than 0.75. Since we use variables recorded by body sensors that could be mutually influenced, I choose a bit higher value of 0.8, 
+
+4. the predictors with near-zero variance should be excluded. However, all of them were already excluded within the previous steps,  
+
+5. we subset the training data into training and testing sets and set up the training run with the (x, y) syntax [^fn3]  
+
+
+```{r procData}
+# 1. Exclude the 1st and 6th columns
+preTest <- preTest[, -c(1, 6)] 
+preTrain <- preTrain[, -c(1, 6)]
+
+# 2. Exclude the columns with too many NAs (cut off at 90%)
+training <- preTrain[,colSums(is.na(preTrain))/nrow(preTrain) < 0.9]
+cIndex <- which(!(colnames(preTrain) %in% colnames(training)))
+testing <- preTest[, - cIndex]
+
+# 3. Exclude the predictors that are highly correlated
+analyseDataTrain <- sapply(training[,-58], as.numeric) # column 58 is the target variable
+corMat <- cor(analyseDataTrain)
+highCor <- findCorrelation(corMat, cutoff=0.8)
+trainingCor <- training[, -highCor]
+testingCor <- testing[, -highCor]
+
+# 4. Exclude the predictors with very small variance
+#nsv <- nearZeroVar(trainingCor) # in this case nsv is empty
+
+# 5. Subset the data
+set.seed(123)
+subsets <- createDataPartition(y=trainingCor$classe, p=0.75, list=FALSE)
+subTrainingCor <- trainingCor[subsets, ] 
+subTestingCor <- trainingCor[-subsets, ]
+x <- subTrainingCor[, -44] # column 44 is the target variable
+y <- subTrainingCor[, 44]
+rm(preTest, preTrain,testing, training, cIndex, analyseDataTrain, corMat, highCor, subsets)
+```
+
+### Setting up the parallel Environment
+
+Since the training run could take a long time to complete on one cluster, I opt for a run on a parallel environment with the following configuration:  
+
+| Computer               | Configuration                                                               |
+|------------------------|-----------------------------------------------------------------------------|
+| Samsung Series 5 Ultra | * Operating system: Windows 10 (64 Bits)                                   |
+|                        | * Processor: Intel Corei5 3337U @ 1.80GHz up to 2.7GHz (2 cores, 4 threads) |
+|                        | * RAM: 8 Gb                                                                 |
+|                        | * Disk: 512 Gb SSD                                                          |
+
+```{r parallelEnvironment}
+cluster <- makeCluster(detectCores() - 1) # 3
+registerDoParallel(cluster) 
+```
+
+### Model fitting
+The **trainControl** was set to use the K-fold cross-validation as it represents a robust method to estimate the model's accuracy. The choice of k = 5 has been empirically shown to avoid high bias and variance when estimating the test error rate [^fn4].
+
+In this experiment, 6 participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions:  
+
+* exactly according to the specification (Class A)  
+* throwing the elbows to the front (Class B)  
+* lifting the dumbbell only halfway (Class C)  
+* lowering the dumbbell only halfway (Class D)  
+* throwing the hips to the front (Class E).
+
+While the class A corresponds to the specified execution of the exercise, the other 4 classes correspond to common mistakes.
+
+As we try to predict these behaviors through predictor variables, the **target variable**, "classe", is thus a factor with 5 different levels corresponding to the five preceding cases.
+
+To illustrate the difference in accuracy according to the method used, three different machine learning methods are chosen:
+
+#### 1. Decision tree
+
+```{r DecisionTree}
+set.seed(123)
+control = trainControl(method = "cv", number = 5, allowParallel = TRUE)
+modelRPART <- train(x, y, method = "rpart", trControl = control) 
+```
+
+```{r ModelPredRPART}
+modelRPART$results
+predRPART <- predict(modelRPART, subTestingCor)
+cfMatRPART <- confusionMatrix(subTestingCor$classe, predRPART)
+cfMatRPART$overall
+cfMatRPART$table
+fancyRpartPlot(modelRPART$finalModel)
+```
+  
+The model obtained has a low accuracy of 55,66% and cannot be used to predict the results of the quiz.
+
+#### 2. Stochastic Gradient boosting
+
+```{r GBM, results = FALSE}
+set.seed(123) 
+modelGBM <- train(x, y, method = "gbm", trControl = control) 
+```
+```{r modelPredGBM}
+modelGBM$results
+predGBM <- predict(modelGBM, subTestingCor) 
+cfMatGBM <- confusionMatrix(subTestingCor$classe, predGBM)
+cfMatGBM$overall
+cfMatGBM$table
+```
+  
+The model from the GBM method presents very high accuracy on train set (99.74%) as well as on test set (99,78%). Since these values are too close there is no overfitting on the train set. On the other hand, one can notice that the test accuracy is slightly better than the train one. Nonetheless, the difference is in fact too small as it corresponds to **less than** two additional good predictions on the test set and could be induced by the smallest number of observations. The computational time is of 579s.
+
+#### 3. Random forest
+
+```{r RF}
+set.seed(123)
+modelRF <- train(x, y, method = "rf", trControl = control)
+modelRF$results 
+predRF <- predict(modelRF, subTestingCor)
+cfMatRF <- confusionMatrix(subTestingCor$classe, predRF)
+rm(control)
+stopCluster(cluster)
+registerDoSEQ()
+cfMatRF$overall
+cfMatRF$table
+```
+
+The obtained model shows very high accuracies. As for the GBM method, the train and test accuracies are once again too close with the latter slightly better than the first. There is thus no overfitting on the train set.
+
+Yet, to avoid doubts on the resampling method, I computed a new model using ***repeatedcv*** on the same data set. The accuracies obtained with 5 repeats (99,88%) are exactly the same and are very close to the ones obtained previously.
+
+### Comparison between the different methods
+```{r compModels}
+results <- resamples(list(RPART=modelRPART, GBM=modelGBM, RF=modelRF))
+results$timings 
+bwplot(results)
+```
+  
+Apart of the RPART method, the models obtained with the GBM and RF methods fit the test data very well. The standard deviations of the accuracies are also very small which suggests that the data collected with the body sensors is very accurate. The big difference in processing time between the GBM and RF methods (more than the double) poses the problem of performance when using a time-consuming method for just a little improvement. Of course, for this project, one can afford using the RF method to predict the cases from the quiz. However, once the data becomes very big, it is important to assess all these different aspects taking into consideration the acceptable margin of error.
+
+### Predictor's importance in Random Forest
+
+```{r predImportance}
+importanceRF <- varImp(modelRF,scale = FALSE)
+plot(importanceRF, top= 10) 
+```
+
+It is very interesting to notice that, the most important predictors used in RF method are the ***raw_timestamp_part_1*** and the ***num_window***. Since the data was recorded by body sensors using a sliding time window with different durations, it is therefore necessary to look at the observations according to there corresponding time stamp and window number. While this behavior is intuitive for a human being, the fact remains that it is not obvious for a machine. Fortunately, the RF algorithm permitted to learn from the data enough to spot this fact.
+
+### Application to the data set of the quiz 
+```{r predQuizz}
+predict(modelRF, testingCor) 
+#rm(list = ls())
+```
+
+
+### Bibliography
+
+[^fn3]: https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+
+[^fn4]: http://www.sthda.com/english/articles/38-regression-model-validation/157-cross-validation-essentials-in-r/
+
+
+
